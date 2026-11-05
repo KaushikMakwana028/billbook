@@ -33,73 +33,35 @@ class Sales extends My_Controller
         $adminId = (int) ($this->admin['user_id'] ?? 0);
         $data = $this->buildBaseData($adminId);
 
-        $filters = [
-            'search' => trim((string) $this->input->get('search', true)),
+        $rawFilters = [
+            'search'    => trim((string) $this->input->get('search', true)),
             'date_from' => trim((string) $this->input->get('date_from', true)),
-            'date_to' => trim((string) $this->input->get('date_to', true))
+            'date_to'   => trim((string) $this->input->get('date_to', true))
         ];
-
-
+        $filters = $this->normalizeFilters($rawFilters);
 
         // Pagination
         $page = max(1, (int)($this->input->get('page') ?? 1));
         $limit = 10;
         $offset = ($page - 1) * $limit;
 
-        // ✅ COUNT WITH FILTERS (IMPORTANT FIX)
-        $countQuery = $this->db
-            ->from('sales')
-            ->where('admin_id', $adminId);
+        // Metrics (Total Rows, Total Sales, Total Profit)
+        $metrics = $this->getSalesMetrics($adminId, $filters);
+        $totalRows = (int)$metrics['total_rows'];
 
-        if (!empty($filters['search'])) {
-            $countQuery->group_start()
-                ->like('invoice_number', $filters['search'])
-                ->group_end();
-        }
+        $data['totalRows']   = $totalRows;
+        $data['totalSales']  = (float)$metrics['total_sales'];
+        $data['totalProfit'] = (float)$metrics['total_profit'];
 
-        if (!empty($filters['date_from'])) {
-            $countQuery->where('DATE(sale_date) >=', $filters['date_from']);
-        }
-
-        if (!empty($filters['date_to'])) {
-            $countQuery->where('DATE(sale_date) <=', $filters['date_to']);
-        }
-
-        $totalRows = $countQuery->count_all_results();
-        $data['totalRows'] = $totalRows;
-
-        // ✅ TOTAL REVENUE (ALL RECORDS, NOT PAGINATED)
-        $revenueQuery = $this->db
-            ->select_sum('grand_total')
-            ->from('sales')
-            ->where('admin_id', $adminId);
-
-        // Apply same filters
-        if (!empty($filters['search'])) {
-            $revenueQuery->group_start()
-                ->like('invoice_number', $filters['search'])
-                ->group_end();
-        }
-
-        if (!empty($filters['date_from'])) {
-            $revenueQuery->where('DATE(sale_date) >=', $filters['date_from']);
-        }
-
-        if (!empty($filters['date_to'])) {
-            $revenueQuery->where('DATE(sale_date) <=', $filters['date_to']);
-        }
-
-        $totalRevenueRow = $revenueQuery->get()->row();
-        $data['totalRevenue'] = $totalRevenueRow->grand_total ?? 0;
-
-        $data['totalPages'] = ceil($totalRows / $limit);
+        $data['totalPages']  = ceil($totalRows / $limit);
         $data['currentPage'] = $page;
+        $data['perPage']     = $limit;
 
-        // ✅ ONLY ONE CALL (WITH LIMIT)
-        $data['sales'] = $this->getSales($adminId, $filters, $limit, $offset);
+        // Fetch paginated sales
+        $data['sales']       = $this->getSales($adminId, $filters, $limit, $offset);
 
-        $data['filters'] = $filters;
-        $data['pageTitle'] = 'Sales';
+        $data['filters']     = $filters;
+        $data['pageTitle']   = 'Sales';
 
         $this->load->view('header', $data);
         $this->load->view('sales_view', $data);
@@ -1478,6 +1440,77 @@ $saleDate = $pickedDate . ' ' . date('H:i:s');
         ];
     }
 
+    private function normalizeFilters(array $filters): array
+    {
+        $normalized = [
+            'search'    => trim((string)($filters['search'] ?? '')),
+            'date_from' => '',
+            'date_to'   => ''
+        ];
+
+        if (!empty($filters['date_from'])) {
+            $ts = strtotime(str_replace('/', '-', trim((string)$filters['date_from'])));
+            if ($ts !== false) {
+                $normalized['date_from'] = date('Y-m-d', $ts);
+            }
+        }
+
+        if (!empty($filters['date_to'])) {
+            $ts = strtotime(str_replace('/', '-', trim((string)$filters['date_to'])));
+            if ($ts !== false) {
+                $normalized['date_to'] = date('Y-m-d', $ts);
+            }
+        }
+
+        return $normalized;
+    }
+
+    private function getSalesMetrics(int $adminId, array $filters = []): array
+    {
+        $this->db->select("
+            COUNT(s.id) AS total_rows,
+            COALESCE(SUM(s.grand_total), 0) AS total_sales,
+            COALESCE(SUM(s.grand_total) - SUM(COALESCE(item_cost.total_cogs, 0)), 0) AS total_profit
+        ", false);
+        $this->db->from('sales s');
+        $this->db->join('customers c', 'c.id = s.customer_id', 'left');
+        $this->db->join("
+            (
+                SELECT 
+                    si.sale_id,
+                    SUM(COALESCE(NULLIF(si.purchase_price, 0), p.purchase_price, 0) * si.quantity) AS total_cogs
+                FROM sale_items si
+                LEFT JOIN product p ON p.id = si.product_id
+                GROUP BY si.sale_id
+            ) item_cost", "item_cost.sale_id = s.id", "left", false);
+        $this->db->where('s.admin_id', $adminId);
+
+        if (!empty($filters['search'])) {
+            $search = $filters['search'];
+            $this->db->group_start()
+                ->like('s.invoice_number', $search)
+                ->or_like('c.name', $search)
+                ->or_like('c.phone', $search)
+                ->group_end();
+        }
+
+        if (!empty($filters['date_from'])) {
+            $this->db->where('DATE(s.sale_date) >=', $filters['date_from']);
+        }
+
+        if (!empty($filters['date_to'])) {
+            $this->db->where('DATE(s.sale_date) <=', $filters['date_to']);
+        }
+
+        $row = $this->db->get()->row_array();
+
+        return [
+            'total_rows'   => (int)($row['total_rows'] ?? 0),
+            'total_sales'  => (float)($row['total_sales'] ?? 0),
+            'total_profit' => (float)($row['total_profit'] ?? 0)
+        ];
+    }
+
     private function getSales(int $adminId, array $filters = [], int $limit = 10, int $offset = 0): array
     {
         $query = $this->db
@@ -1515,42 +1548,30 @@ $saleDate = $pickedDate . ' ' . date('H:i:s');
     {
         $adminId = (int) ($this->admin['user_id'] ?? 0);
 
-        $filters = [
-            'search' => trim((string) $this->input->get('search')),
+        $rawFilters = [
+            'search'    => trim((string) $this->input->get('search')),
             'date_from' => trim((string) $this->input->get('date_from')),
-            'date_to' => trim((string) $this->input->get('date_to'))
+            'date_to'   => trim((string) $this->input->get('date_to'))
         ];
+        $filters = $this->normalizeFilters($rawFilters);
 
         $page = max(1, (int)$this->input->get('page'));
         $limit = 10;
         $offset = ($page - 1) * $limit;
 
-        // total count with filters
-        $countQuery = $this->db
-            ->from('sales')
-            ->where('admin_id', $adminId);
-
-        if (!empty($filters['search'])) {
-            $countQuery->like('invoice_number', $filters['search']);
-        }
-
-        if (!empty($filters['date_from'])) {
-            $countQuery->where('DATE(sale_date) >=', $filters['date_from']);
-        }
-
-        if (!empty($filters['date_to'])) {
-            $countQuery->where('DATE(sale_date) <=', $filters['date_to']);
-        }
-
-        $totalRows = $countQuery->count_all_results();
+        $metrics = $this->getSalesMetrics($adminId, $filters);
+        $totalRows = (int)$metrics['total_rows'];
 
         $sales = $this->getSales($adminId, $filters, $limit, $offset);
 
         echo json_encode([
-            'sales' => $sales,
-            'totalPages' => ceil($totalRows / $limit),
+            'sales'       => $sales,
+            'totalPages'  => (int)ceil($totalRows / $limit),
             'currentPage' => $page,
-            'totalRows' => $totalRows
+            'perPage'     => $limit,
+            'totalRows'   => $totalRows,
+            'totalSales'  => (float)$metrics['total_sales'],
+            'totalProfit' => (float)$metrics['total_profit']
         ]);
     }
 
@@ -1828,9 +1849,15 @@ $saleDate = $pickedDate . ' ' . date('H:i:s');
             return;
         }
 
-        $date_from = $this->input->get('date_from');
-        $date_to   = $this->input->get('date_to');
-        $search    = trim((string)$this->input->get('search'));
+        $rawFilters = [
+            'search'    => trim((string)$this->input->get('search')),
+            'date_from' => trim((string)$this->input->get('date_from')),
+            'date_to'   => trim((string)$this->input->get('date_to'))
+        ];
+        $filters = $this->normalizeFilters($rawFilters);
+        $search    = $filters['search'];
+        $date_from = $filters['date_from'];
+        $date_to   = $filters['date_to'];
         $businessName = $this->admin['business_name'] ?? 'My Business';
 
         // ─── FETCH SALES WITH ITEMS ───
@@ -1848,7 +1875,7 @@ $saleDate = $pickedDate . ' ' . date('H:i:s');
         si.product_name,
         si.quantity,
         si.unit_price,
-        si.purchase_price,
+        COALESCE(NULLIF(si.purchase_price, 0), p.purchase_price, 0) as purchase_price,
         si.discount_amount as item_discount,
         si.discount_percent,
         si.line_total
@@ -1857,6 +1884,7 @@ $saleDate = $pickedDate . ' ' . date('H:i:s');
         $this->db->from('sales s');
         $this->db->join('customers c', 'c.id = s.customer_id', 'left');
         $this->db->join('sale_items si', 'si.sale_id = s.id', 'inner');
+        $this->db->join('product p', 'p.id = si.product_id', 'left');
         $this->db->where('s.admin_id', $adminId);
 
         if (!empty($search)) {

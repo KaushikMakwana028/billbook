@@ -1276,7 +1276,7 @@
                                         Reset
                                     </a>
                                     <a href="<?= base_url('sales/export?search=' . urlencode($filters['search'] ?? '') . '&date_from=' . urlencode($filters['date_from'] ?? '') . '&date_to=' . urlencode($filters['date_to'] ?? '')) ?>"
-                                        class="btn-export">
+                                        class="btn-export" id="btnExport">
                                         <i class="fa fa-file-excel"></i> Export
                                     </a>
                                 </div>
@@ -1383,18 +1383,16 @@
 
                         <div id="paginationContainer" class="d-flex justify-content-center mt-3"></div>
                         <!-- ── Stats chips ── -->
-                        <?php if (!empty($sales)): ?>
-                            <div class="sales-stats">
-                                <div class="sales-stat-chip">
-                                    <span class="stat-dot stat-dot-blue"></span>
-                                    Total Records: <strong><?= $totalRows ?></strong>
-                                </div>
-                                <div class="sales-stat-chip">
-                                    <span class="stat-dot stat-dot-green"></span>
-                                    Total Revenue: <strong>Rs. <?= number_format($totalRevenue, 2) ?></strong>
-                                </div>
+                        <div class="sales-stats" id="salesStatsContainer" style="<?= empty($sales) ? 'display:none;' : '' ?>">
+                            <div class="sales-stat-chip">
+                                <span class="stat-dot stat-dot-blue"></span>
+                                Total Sales: <strong id="statTotalSales">Rs. <?= number_format($totalSales ?? 0, 2) ?></strong>
                             </div>
-                        <?php endif; ?>
+                            <div class="sales-stat-chip">
+                                <span class="stat-dot stat-dot-green"></span>
+                                Total Profit: <strong id="statTotalProfit" style="<?= ($totalProfit ?? 0) < 0 ? 'color:#dc2626;' : '' ?>">Rs. <?= number_format($totalProfit ?? 0, 2) ?></strong>
+                            </div>
+                        </div>
 
                     </div>
                 </div>
@@ -1405,23 +1403,42 @@
 
 
 <script>
-    function loadSales(page = 1) {
-        const search = document.querySelector('[name="search"]').value;
-        const date_from = document.querySelector('[name="date_from"]').value;
-        const date_to = document.querySelector('[name="date_to"]').value;
+    function fmtMoney(val) {
+        const num = parseFloat(val) || 0;
+        return 'Rs. ' + num.toLocaleString('en-IN', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        });
+    }
 
-        fetch(`<?= base_url('sales/ajax_list') ?>?page=${page}&search=${search}&date_from=${date_from}&date_to=${date_to}`)
+    function loadSales(page = 1) {
+        const searchInput = document.querySelector('[name="search"]');
+        const dateFromInput = document.querySelector('[name="date_from"]');
+        const dateToInput = document.querySelector('[name="date_to"]');
+
+        const search = searchInput ? searchInput.value.trim() : '';
+        const date_from = dateFromInput ? dateFromInput.value.trim() : '';
+        const date_to = dateToInput ? dateToInput.value.trim() : '';
+
+        // Keep Export button URL synced with active filters
+        const exportBtn = document.getElementById('btnExport');
+        if (exportBtn) {
+            exportBtn.href = `<?= base_url('sales/export') ?>?search=${encodeURIComponent(search)}&date_from=${encodeURIComponent(date_from)}&date_to=${encodeURIComponent(date_to)}`;
+        }
+
+        fetch(`<?= base_url('sales/ajax_list') ?>?page=${page}&search=${encodeURIComponent(search)}&date_from=${encodeURIComponent(date_from)}&date_to=${encodeURIComponent(date_to)}`)
             .then(res => res.json())
             .then(data => {
 
                 let html = '';
+                const perPage = Number(data.perPage) || 10;
 
-                if (data.sales.length > 0) {
+                if (data.sales && data.sales.length > 0) {
                     data.sales.forEach((sale, index) => {
 
                         html += `
                         <tr>
-                            <td><span class="row-num">${(data.currentPage - 1) * data.perPage + index + 1}</span></td>
+                            <td><span class="row-num">${(data.currentPage - 1) * perPage + index + 1}</span></td>
 
                             <td>
                                ${(!sale.customer_name || sale.customer_name.toLowerCase() === 'walk-in customer')
@@ -1482,7 +1499,33 @@
                 }
 
                 document.getElementById('salesTableBody').innerHTML = html;
-                document.querySelector('.sales-stat-chip strong').innerText = data.totalRows;
+
+                // Update Total Sales & Total Profit
+                const elSales = document.getElementById('statTotalSales');
+                if (elSales) {
+                    elSales.innerText = fmtMoney(data.totalSales);
+                }
+
+                const elProfit = document.getElementById('statTotalProfit');
+                if (elProfit) {
+                    const pVal = parseFloat(data.totalProfit) || 0;
+                    if (pVal < 0) {
+                        elProfit.innerText = '-Rs. ' + Math.abs(pVal).toLocaleString('en-IN', {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                        });
+                        elProfit.style.color = '#dc2626';
+                    } else {
+                        elProfit.innerText = fmtMoney(pVal);
+                        elProfit.style.color = '';
+                    }
+                }
+
+                const statsContainer = document.getElementById('salesStatsContainer');
+                if (statsContainer) {
+                    statsContainer.style.display = (data.totalRows > 0) ? 'flex' : 'none';
+                }
+
                 renderPagination(data.currentPage, data.totalPages);
             });
     }

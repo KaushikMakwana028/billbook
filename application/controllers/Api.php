@@ -26,6 +26,22 @@ class Api extends CI_Controller
         $this->load->library(['form_validation']);
         $this->load->helper(['url', 'form']);
 
+        $this->db->query("CREATE TABLE IF NOT EXISTS user_login_otps (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            mobile VARCHAR(20) NOT NULL,
+            otp VARCHAR(10) NOT NULL,
+            expires_at DATETIME NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );");
+
+        $this->db->query("CREATE TABLE IF NOT EXISTS user_registration_otps (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            mobile VARCHAR(20) NOT NULL,
+            otp VARCHAR(10) NOT NULL,
+            expires_at DATETIME NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );");
+
         $this->db->query("CREATE TABLE IF NOT EXISTS invoice_templates (
             id INT AUTO_INCREMENT PRIMARY KEY,
             admin_id INT NOT NULL,
@@ -2165,7 +2181,7 @@ class Api extends CI_Controller
     | GET DASHBOARD DATA
     | GET /api/dashboard
     | Headers: Authorization: Bearer <token>
-    | Query params: filter (day/week/month/year), month_picker (YYYY-MM), year_picker (YYYY)
+    | Query params: filter (day/week/month/year), from_date, to_date, month_picker (YYYY-MM), year_picker (YYYY)
     |-----------------------------------------------------------------------*/
     public function dashboard(): void
     {
@@ -2177,12 +2193,34 @@ class Api extends CI_Controller
         $monthPicker = trim((string) ($this->input_value('month_picker'))); // "YYYY-MM"
         $yearPicker  = (int) ($this->input_value('year_picker'));
 
-        if (!in_array($filter, ['day', 'week', 'month', 'year'], true)) {
+        $rawFrom = trim((string) ($this->input_value('from_date') ?: $this->input_value('from')));
+        $rawTo   = trim((string) ($this->input_value('to_date') ?: $this->input_value('to')));
+
+        $fromDate = '';
+        if (!empty($rawFrom)) {
+            $ts = strtotime(str_replace('/', '-', $rawFrom));
+            if ($ts !== false) {
+                $fromDate = date('Y-m-d', $ts);
+            }
+        }
+
+        $toDate = '';
+        if (!empty($rawTo)) {
+            $ts = strtotime(str_replace('/', '-', $rawTo));
+            if ($ts !== false) {
+                $toDate = date('Y-m-d', $ts);
+            }
+        }
+
+        if (!in_array($filter, ['day', 'week', 'month', 'year', 'custom'], true)) {
             $filter = 'day';
         }
 
         // Resolve active mode
-        if (!empty($monthPicker) && preg_match('/^\d{4}-\d{2}$/', $monthPicker)) {
+        if (!empty($fromDate) || !empty($toDate)) {
+            $activeMode = 'custom_range';
+            $filter     = 'custom';
+        } elseif (!empty($monthPicker) && preg_match('/^\d{4}-\d{2}$/', $monthPicker)) {
             $activeMode = 'custom_month';
         } elseif ($yearPicker >= 2000 && $yearPicker <= 2100) {
             $activeMode = 'custom_year';
@@ -2198,36 +2236,55 @@ class Api extends CI_Controller
 
         // ── Customer count (filtered) ──────────────────────────────────────
         $custQ = $this->db->where('admin_id', $adminId)->where('isActive', 1);
-        $this->apply_date_filter($custQ, $activeMode, 'created_on', $monthPicker, $yearPicker);
+        $this->apply_date_filter($custQ, $activeMode, 'created_on', $monthPicker, $yearPicker, $fromDate, $toDate);
         $customerCount = $custQ->count_all_results('customers');
 
-        // ── Total Sales — TODAY only (never changes with filter) ───────────
+        // ── Total Sales — TODAY only ───────────────────────────────────────
         $todaySalesRow   = $this->db
-            ->select('SUM(grand_total) AS total_sales', false)
+            ->select('COALESCE(SUM(grand_total), 0) AS total_sales', false)
             ->from('sales')
             ->where('admin_id', $adminId)
             ->where('DATE(sale_date)', date('Y-m-d'))
             ->get()->row_array();
         $todayTotalSales = (float) ($todaySalesRow['total_sales'] ?? 0);
 
-        // ── Total Profit — TODAY only (never changes with filter) ──────────
+        // ── Total Profit — TODAY only ──────────────────────────────────────
         $todayProfitRow = $this->db
-            ->select('SUM(si.line_total - (p.purchase_price * si.quantity)) AS profit', false)
+            ->select('COALESCE(SUM(si.line_total - (p.purchase_price * si.quantity)), 0) AS profit', false)
             ->from('sale_items si')
             ->join('sales s', 's.id = si.sale_id')
             ->join('product p', 'p.id = si.product_id', 'left')
             ->where('s.admin_id', $adminId)
             ->where('DATE(s.sale_date)', date('Y-m-d'))
             ->get()->row_array();
-
         $todayTotalProfit = (float) ($todayProfitRow['profit'] ?? 0);
+
+        // ── Filtered Total Sales (for the active period/custom range) ──────
+        $salesQ = $this->db
+            ->select('COALESCE(SUM(grand_total), 0) AS total_sales', false)
+            ->from('sales')
+            ->where('admin_id', $adminId);
+        $this->apply_date_filter($salesQ, $activeMode, 'sale_date', $monthPicker, $yearPicker, $fromDate, $toDate);
+        $filteredSalesRow   = $salesQ->get()->row_array();
+        $filteredTotalSales = (float) ($filteredSalesRow['total_sales'] ?? 0);
+
+        // ── Filtered Total Profit (for the active period/custom range) ─────
+        $profitQ = $this->db
+            ->select('COALESCE(SUM(si.line_total - (p.purchase_price * si.quantity)), 0) AS profit', false)
+            ->from('sale_items si')
+            ->join('sales s', 's.id = si.sale_id')
+            ->join('product p', 'p.id = si.product_id', 'left')
+            ->where('s.admin_id', $adminId);
+        $this->apply_date_filter($profitQ, $activeMode, 's.sale_date', $monthPicker, $yearPicker, $fromDate, $toDate);
+        $profitRow           = $profitQ->get()->row_array();
+        $filteredTotalProfit = (float) ($profitRow['profit'] ?? 0);
 
         // ── Total Purchase (filtered) ──────────────────────────────────────
         $purchQ = $this->db
-            ->select('SUM(purchase_price * quantity) AS total_purchase', false)
+            ->select('COALESCE(SUM(purchase_price * quantity), 0) AS total_purchase', false)
             ->where('admin_id', $adminId)
             ->where('isActive', 1);
-        $this->apply_date_filter($purchQ, $activeMode, 'created_on', $monthPicker, $yearPicker);
+        $this->apply_date_filter($purchQ, $activeMode, 'created_on', $monthPicker, $yearPicker, $fromDate, $toDate);
         $purchRow              = $purchQ->get('product')->row_array();
         $filteredTotalPurchase = (float) ($purchRow['total_purchase'] ?? 0);
 
@@ -2264,7 +2321,17 @@ class Api extends CI_Controller
             'year'  => 'This Year',
         ];
 
-        if ($activeMode === 'custom_month' && !empty($monthPicker)) {
+        if ($activeMode === 'custom_range') {
+            if (!empty($fromDate) && !empty($toDate)) {
+                $filterLabel = date('d M Y', strtotime($fromDate)) . ' to ' . date('d M Y', strtotime($toDate));
+            } elseif (!empty($fromDate)) {
+                $filterLabel = 'From ' . date('d M Y', strtotime($fromDate));
+            } elseif (!empty($toDate)) {
+                $filterLabel = 'Until ' . date('d M Y', strtotime($toDate));
+            } else {
+                $filterLabel = 'Custom Date Range';
+            }
+        } elseif ($activeMode === 'custom_month' && !empty($monthPicker)) {
             $filterLabel = date('F Y', strtotime($monthPicker . '-01'));
         } elseif ($activeMode === 'custom_year' && $yearPicker) {
             $filterLabel = 'Year ' . $yearPicker;
@@ -2275,7 +2342,7 @@ class Api extends CI_Controller
         // ── Chart Data ─────────────────────────────────────────────────────
         // ── Sales per day ──────────────────────────────────────────────────
         $sQ = $this->db->from('sales')->where('admin_id', $adminId);
-        $this->apply_date_filter($sQ, $activeMode, 'sale_date', $monthPicker, $yearPicker);
+        $this->apply_date_filter($sQ, $activeMode, 'sale_date', $monthPicker, $yearPicker, $fromDate, $toDate);
         $salesRows = $sQ
             ->select('DATE(sale_date) AS date, SUM(grand_total) AS total')
             ->group_by('DATE(sale_date)')
@@ -2288,7 +2355,7 @@ class Api extends CI_Controller
             ->from('sale_items si')
             ->join('sales s', 's.id = si.sale_id')
             ->where('s.admin_id', $adminId);
-        $this->apply_date_filter($pQ, $activeMode, 's.sale_date', $monthPicker, $yearPicker);
+        $this->apply_date_filter($pQ, $activeMode, 's.sale_date', $monthPicker, $yearPicker, $fromDate, $toDate);
         $profitRows = $pQ
             ->join('product p', 'p.id = si.product_id', 'left')
             ->select('DATE(s.sale_date) AS date, 
@@ -2324,12 +2391,16 @@ class Api extends CI_Controller
             'filter'                  => $filter,
             'active_mode'             => $activeMode,
             'filter_label'            => $filterLabel,
+            'from_date'               => $fromDate ?: null,
+            'to_date'                 => $toDate ?: null,
             'month_picker'            => $monthPicker,
             'year_picker'             => $yearPicker ?: null,
             'product_count'           => $productCount,
             'customer_count'          => $customerCount,
             'today_total_sales'       => $todayTotalSales,
             'today_total_profit'      => $todayTotalProfit,
+            'filtered_total_sales'    => $filteredTotalSales,
+            'filtered_total_profit'   => $filteredTotalProfit,
             'filtered_total_purchase' => $filteredTotalPurchase,
             'low_stock_count'         => count($lowStockProducts),
             'low_stock_products'      => $lowStockProducts,
@@ -2340,7 +2411,7 @@ class Api extends CI_Controller
         $this->send_response(true, 'Dashboard data fetched successfully.', $response);
     }
 
-    private function apply_date_filter($q, string $mode, string $col, string $monthPicker = '', int $yearPicker = 0): void
+    private function apply_date_filter($q, string $mode, string $col, string $monthPicker = '', int $yearPicker = 0, string $fromDate = '', string $toDate = ''): void
     {
         switch ($mode) {
             case 'day':
@@ -2370,6 +2441,15 @@ class Api extends CI_Controller
             case 'custom_year':
                 if ($yearPicker >= 2000 && $yearPicker <= 2100) {
                     $q->where("YEAR($col)", $yearPicker);
+                }
+                break;
+
+            case 'custom_range':
+                if (!empty($fromDate)) {
+                    $q->where("DATE($col) >=", $fromDate);
+                }
+                if (!empty($toDate)) {
+                    $q->where("DATE($col) <=", $toDate);
                 }
                 break;
         }
