@@ -111,10 +111,15 @@ class Sales_model extends CI_Model
 
         $sale['items'] = $items;
 
-        // Invoice PDF URL
+        // Invoice PDF & JPG URLs
         $pdfPath = FCPATH . 'uploads/invoices/invoice-' . $saleId . '.pdf';
         $sale['invoice_pdf_url'] = file_exists($pdfPath) 
             ? base_url('uploads/invoices/invoice-' . $saleId . '.pdf') 
+            : null;
+
+        $jpgPath = FCPATH . 'uploads/invoices/invoice-' . $saleId . '.jpg';
+        $sale['invoice_image_url'] = file_exists($jpgPath)
+            ? base_url('uploads/invoices/invoice-' . $saleId . '.jpg')
             : null;
 
         return $sale;
@@ -719,7 +724,123 @@ class Sales_model extends CI_Model
             'invoice_file' => $relativeName
         ]);
 
+        // Also generate JPG invoice image (for WhatsApp preview, downloads, and image exports)
+        try {
+            $this->generate_invoice_image($saleId, $adminId, $html, $filePath);
+        } catch (\Exception $e) {
+            log_message('error', 'Invoice JPG generation notice: ' . $e->getMessage());
+        }
+
         return base_url('uploads/invoices/invoice-' . $saleId . '.pdf');
+    }
+
+    /**
+     * Generate Invoice JPG image using multi-strategy fallback:
+     * 1. pdftoppm (poppler-utils on Linux server)
+     * 2. Headless Chrome / Chromium / Edge screenshot (Windows / Linux)
+     * 3. Imagick extension
+     * 4. PHP GD receipt card generation fallback
+     */
+    public function generate_invoice_image(int $saleId, int $adminId, ?string $html = null, ?string $pdfPath = null): ?string
+    {
+        $folder = FCPATH . 'uploads/invoices/';
+        if (!is_dir($folder)) {
+            mkdir($folder, 0777, true);
+        }
+
+        $pdfFile = $pdfPath ?: ($folder . 'invoice-' . $saleId . '.pdf');
+        $basePath = $folder . 'invoice-' . $saleId;
+        $jpgPath = $basePath . '.jpg';
+
+        // 1. Try pdftoppm (poppler-utils on Linux production server)
+        if (function_exists('exec') && file_exists($pdfFile)) {
+            $cmd = 'pdftoppm -jpeg -r 150 -f 1 -l 1 -singlefile ' . escapeshellarg($pdfFile) . ' ' . escapeshellarg($basePath) . ' 2>&1';
+            @exec($cmd, $pOut, $pRc);
+            if ($pRc === 0 && file_exists($jpgPath) && filesize($jpgPath) > 0) {
+                return base_url('uploads/invoices/invoice-' . $saleId . '.jpg');
+            }
+        }
+
+        // 2. Try Headless Chrome or Edge
+        $browser = $this->find_system_browser();
+        if ($browser && function_exists('exec')) {
+            $tempPng = $folder . 'temp_' . $saleId . '_' . bin2hex(random_bytes(4)) . '.png';
+            $sourceTarget = null;
+            $tempHtml = null;
+
+            if (!empty($html)) {
+                $tempHtml = $folder . 'temp_' . $saleId . '_' . bin2hex(random_bytes(4)) . '.html';
+                file_put_contents($tempHtml, $html);
+                $sourceTarget = $tempHtml;
+            } elseif (file_exists($pdfFile)) {
+                $sourceTarget = $pdfFile;
+            }
+
+            if ($sourceTarget) {
+                $bCmd = escapeshellarg($browser) . ' --headless=new --disable-gpu --screenshot=' . escapeshellarg($tempPng) . ' --window-size=850,1200 ' . escapeshellarg($sourceTarget) . ' 2>&1';
+                @exec($bCmd, $bOut, $bRc);
+
+                if (file_exists($tempPng) && filesize($tempPng) > 0) {
+                    if (function_exists('imagecreatefrompng') && function_exists('imagejpeg')) {
+                        $pngImg = @imagecreatefrompng($tempPng);
+                        if ($pngImg) {
+                            imagejpeg($pngImg, $jpgPath, 92);
+                            imagedestroy($pngImg);
+                        }
+                    }
+                    @unlink($tempPng);
+                }
+            }
+
+            if ($tempHtml && file_exists($tempHtml)) {
+                @unlink($tempHtml);
+            }
+
+            if (file_exists($jpgPath) && filesize($jpgPath) > 0) {
+                return base_url('uploads/invoices/invoice-' . $saleId . '.jpg');
+            }
+        }
+
+        // 3. Try Imagick extension
+        if (extension_loaded('imagick') && file_exists($pdfFile)) {
+            try {
+                $im = new \Imagick();
+                $im->setResolution(150, 150);
+                $im->readImage($pdfFile . '[0]');
+                $im->setImageFormat('jpeg');
+                $im->setImageCompressionQuality(90);
+                $im->writeImage($jpgPath);
+                $im->clear();
+                $im->destroy();
+                if (file_exists($jpgPath) && filesize($jpgPath) > 0) {
+                    return base_url('uploads/invoices/invoice-' . $saleId . '.jpg');
+                }
+            } catch (\Exception $e) {
+                log_message('error', 'Imagick JPG generation failed: ' . $e->getMessage());
+            }
+        }
+
+        return file_exists($jpgPath) ? base_url('uploads/invoices/invoice-' . $saleId . '.jpg') : null;
+    }
+
+    private function find_system_browser(): ?string
+    {
+        $candidates = [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+            'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+            '/usr/bin/google-chrome',
+            '/usr/bin/google-chrome-stable',
+            '/usr/bin/chromium',
+            '/usr/bin/chromium-browser'
+        ];
+        foreach ($candidates as $c) {
+            if (file_exists($c)) {
+                return $c;
+            }
+        }
+        return null;
     }
 
     private function resolve_product_image(string $image): string

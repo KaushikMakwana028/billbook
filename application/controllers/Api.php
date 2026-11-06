@@ -867,18 +867,59 @@ class Api extends CI_Controller
         $this->require_method('GET');
         $adminId = $this->require_token_user_id();
 
-        $categories = $this->db
-            ->select('category.*, COUNT(product.id) AS productCount')
-            ->from('category')
-            ->join('product', 'product.category_id = category.id AND product.isActive = 1', 'left')
-            ->where('category.admin_id', $adminId)
-            ->where('category.isActive', 1)
-            ->group_by('category.id')
-            ->order_by('category.id', 'DESC')
-            ->get()
-            ->result_array();
+        $page = (int) $this->input_value('page', '0');
+        $limit = max(1, min(100, (int) $this->input_value('limit', '8')));
+        $search = trim((string) $this->input_value('search'));
 
-        $this->send_response(true, 'Categories fetched successfully.', $categories);
+        if ($page > 0) {
+            $this->db->from('category')
+                ->where('category.admin_id', $adminId)
+                ->where('category.isActive', 1);
+
+            if (!empty($search)) {
+                $this->db->like('category.name', $search);
+            }
+
+            $countDb = clone $this->db;
+            $totalRows = (int) $countDb->count_all_results('', false);
+
+            $offset = ($page - 1) * $limit;
+            $categories = $this->db
+                ->select('category.*, COUNT(product.id) AS productCount')
+                ->join('product', 'product.category_id = category.id AND product.isActive = 1', 'left')
+                ->group_by('category.id')
+                ->order_by('category.id', 'DESC')
+                ->limit($limit, $offset)
+                ->get()
+                ->result_array();
+
+            $totalProductsCount = (int) $this->db
+                ->where('admin_id', $adminId)
+                ->where('isActive', 1)
+                ->count_all_results('product');
+
+            $this->send_response(true, 'Categories fetched successfully.', [
+                'categories'           => $categories,
+                'total_rows'           => $totalRows,
+                'total_pages'          => (int) ceil($totalRows / $limit),
+                'current_page'         => $page,
+                'limit'                => $limit,
+                'total_products_count' => $totalProductsCount,
+            ]);
+        } else {
+            $categories = $this->db
+                ->select('category.*, COUNT(product.id) AS productCount')
+                ->from('category')
+                ->join('product', 'product.category_id = category.id AND product.isActive = 1', 'left')
+                ->where('category.admin_id', $adminId)
+                ->where('category.isActive', 1)
+                ->group_by('category.id')
+                ->order_by('category.id', 'DESC')
+                ->get()
+                ->result_array();
+
+            $this->send_response(true, 'Categories fetched successfully.', $categories);
+        }
     }
 
     /*-----------------------------------------------------------------------
@@ -969,22 +1010,128 @@ class Api extends CI_Controller
         $this->require_method('GET');
         $adminId = $this->require_token_user_id();
 
-        $products = $this->db
-            ->select('product.*, category.name AS category_name')
-            ->from('product')
-            ->join('category', 'category.id = product.category_id', 'left')
-            ->where('product.admin_id', $adminId)
-            ->where('product.isActive', 1)
-            ->order_by('product.id', 'DESC')
-            ->get()
-            ->result_array();
+        $page = (int) $this->input_value('page', '0');
+        $limit = max(1, min(100, (int) $this->input_value('limit', '10')));
+        $search = trim((string) $this->input_value('search'));
+        $categoryId = (int) $this->input_value('category_id');
+        $stockFilter = trim((string) $this->input_value('stock_filter'));
+        $statusFilter = trim((string) $this->input_value('status_filter', $this->input_value('status')));
 
-        // Resolve absolute image URLs
-        foreach ($products as &$product) {
-            $product['image'] = $this->resolve_product_image($product['image'] ?? '');
+        if ($page > 0) {
+            $this->db->from('product')
+                ->join('category', 'category.id = product.category_id', 'left')
+                ->where('product.admin_id', $adminId);
+
+            if ($statusFilter === 'active') {
+                $this->db->where('product.isActive', 1);
+            } elseif ($statusFilter === 'disabled' || $statusFilter === 'inactive') {
+                $this->db->where('product.isActive', 0);
+            }
+
+            if (!empty($search)) {
+                $this->db->group_start()
+                    ->like('product.name', $search)
+                    ->or_like('category.name', $search)
+                    ->group_end();
+            }
+
+            if ($categoryId > 0) {
+                $this->db->where('product.category_id', $categoryId);
+            }
+
+            if ($stockFilter === 'low' || $stockFilter === 'low_stock') {
+                $this->db->where('product.quantity >', 0)->where('product.quantity <=', 5);
+            } elseif ($stockFilter === 'out' || $stockFilter === 'out_of_stock') {
+                $this->db->where('product.quantity <=', 0);
+            }
+
+            $countDb = clone $this->db;
+            $totalRows = (int) $countDb->count_all_results('', false);
+
+            $offset = ($page - 1) * $limit;
+            $products = $this->db
+                ->select('product.*, category.name AS category_name')
+                ->order_by('product.id', 'DESC')
+                ->limit($limit, $offset)
+                ->get()
+                ->result_array();
+
+            foreach ($products as &$product) {
+                $product['image'] = $this->resolve_product_image($product['image'] ?? '');
+            }
+
+            // Stats for summary cards
+            $allProducts = $this->db
+                ->select('quantity, price, purchase_price, isActive')
+                ->where('admin_id', $adminId)
+                ->get('product')
+                ->result_array();
+
+            $totalCatalog = count($allProducts);
+            $totalValuation = 0;
+            $lowStockCount = 0;
+            $activeCount = 0;
+            $disabledCount = 0;
+            foreach ($allProducts as $p) {
+                $q = (int) $p['quantity'];
+                $cost = (float) ($p['purchase_price'] > 0 ? $p['purchase_price'] : $p['price']);
+                $totalValuation += ($q * $cost);
+                if ($q <= 5) $lowStockCount++;
+                if ((int)$p['isActive'] === 1) $activeCount++;
+                else $disabledCount++;
+            }
+
+            $this->send_response(true, 'Products fetched successfully.', [
+                'products'        => $products,
+                'total_rows'      => $totalRows,
+                'total_pages'     => (int) ceil($totalRows / $limit),
+                'current_page'    => $page,
+                'limit'           => $limit,
+                'total_catalog'   => $totalCatalog,
+                'total_valuation' => $totalValuation,
+                'low_stock_count' => $lowStockCount,
+                'active_count'    => $activeCount,
+                'disabled_count'  => $disabledCount,
+            ]);
+        } else {
+            $pQuery = $this->db
+                ->select('product.*, category.name AS category_name')
+                ->from('product')
+                ->join('category', 'category.id = product.category_id', 'left')
+                ->where('product.admin_id', $adminId);
+
+            if ($statusFilter === 'active') {
+                $pQuery->where('product.isActive', 1);
+            } elseif ($statusFilter === 'disabled' || $statusFilter === 'inactive') {
+                $pQuery->where('product.isActive', 0);
+            }
+
+            if (!empty($search)) {
+                $pQuery->group_start()
+                    ->like('product.name', $search)
+                    ->or_like('category.name', $search)
+                    ->group_end();
+            }
+
+            if ($categoryId > 0) {
+                $pQuery->where('product.category_id', $categoryId);
+            }
+
+            if ($stockFilter === 'low' || $stockFilter === 'low_stock') {
+                $pQuery->where('product.quantity >', 0)->where('product.quantity <=', 5);
+            } elseif ($stockFilter === 'out' || $stockFilter === 'out_of_stock') {
+                $pQuery->where('product.quantity <=', 0);
+            }
+
+            $products = $pQuery->order_by('product.id', 'DESC')->get()->result_array();
+
+            // Resolve absolute image URLs
+            foreach ($products as &$product) {
+                $product['image'] = $this->resolve_product_image($product['image'] ?? '');
+            }
+
+            $this->send_response(true, 'Products fetched successfully.', $products);
         }
-
-        $this->send_response(true, 'Products fetched successfully.', $products);
     }
 
     /*-----------------------------------------------------------------------
@@ -1132,6 +1279,10 @@ class Api extends CI_Controller
         $purchasePrice = (float) $this->input_value('costPrice');
         $quantity = (int) $this->input_value('stock');
         $isActive = trim($this->input_value('status', 'active')) === 'inactive' ? 0 : 1;
+        $barcode = trim((string) $this->input_value('barcode'));
+        if ($barcode === '') {
+            $barcode = $this->generate_unique_barcode($adminId);
+        }
 
         if (empty($name)) {
             $this->send_response(false, 'Product name is required.', null, 400);
@@ -1179,6 +1330,7 @@ class Api extends CI_Controller
             'sale_price'     => $salePrice,
             'price'          => $salePrice,
             'quantity'       => $quantity,
+            'barcode'        => $barcode,
             'image'          => $imagePath,
             'isActive'       => $isActive,
             'created_on'     => date('Y-m-d')
@@ -1241,6 +1393,15 @@ class Api extends CI_Controller
         if ($purchasePriceStr !== null && $purchasePriceStr !== '') $updateData['purchase_price'] = (float)$purchasePriceStr;
         if ($quantityStr !== null && $quantityStr !== '') $updateData['quantity'] = (int)$quantityStr;
         if ($status !== null && $status !== '') $updateData['isActive'] = trim($status) === 'inactive' ? 0 : 1;
+
+        $barcode = $this->input_value('barcode');
+        if ($barcode !== null) {
+            $barcode = trim((string) $barcode);
+            if ($barcode === '') {
+                $barcode = !empty($product['barcode']) ? $product['barcode'] : $this->generate_unique_barcode($adminId);
+            }
+            $updateData['barcode'] = $barcode;
+        }
 
         $productImageFile = null;
         if (!empty($_FILES['product_image']['name'])) {
@@ -1307,9 +1468,96 @@ class Api extends CI_Controller
             $this->send_response(false, 'Product not found.', null, 404);
         }
 
-        $this->db->where('id', $id)->where('admin_id', $adminId)->update('product', ['isActive' => 0]);
+        $this->db->where('id', $id)->where('admin_id', $adminId)->delete('product');
 
         $this->send_response(true, 'Product deleted successfully.', ['id' => $id]);
+    }
+
+    public function generate_barcode(): void
+    {
+        $this->require_method('GET');
+        $adminId = $this->require_token_user_id();
+        $code = $this->generate_unique_barcode($adminId);
+        $this->send_response(true, 'Unique barcode generated.', ['barcode' => $code]);
+    }
+
+    public function get_barcode_sheet(): void
+    {
+        $this->require_method('GET');
+        $adminId = $this->require_token_user_id();
+        $idsParam = trim((string) $this->input_value('ids'));
+
+        if (empty($idsParam)) {
+            $this->send_response(false, 'No products selected for barcode printing.', null, 400);
+        }
+
+        $pairs = explode(',', $idsParam);
+        $idCopiesMap = [];
+        $productIds = [];
+
+        foreach ($pairs as $pair) {
+            $parts = explode(':', $pair);
+            $pid = (int) ($parts[0] ?? 0);
+            $copies = isset($parts[1]) ? max(1, min(100, (int) $parts[1])) : 1;
+            if ($pid > 0) {
+                $idCopiesMap[$pid] = $copies;
+                $productIds[] = $pid;
+            }
+        }
+
+        if (empty($productIds)) {
+            $this->send_response(false, 'Invalid product IDs.', null, 400);
+        }
+
+        $products = $this->db
+            ->where('admin_id', $adminId)
+            ->where_in('id', $productIds)
+            ->get('product')
+            ->result_array();
+
+        if (empty($products)) {
+            $this->send_response(false, 'No matching products found.', null, 404);
+        }
+
+        require_once FCPATH . 'vendor/autoload.php';
+        $generator = new \Picqer\Barcode\BarcodeGeneratorPNG();
+
+        $items = [];
+        foreach ($products as $prod) {
+            $barcodeVal = trim((string) ($prod['barcode'] ?? ''));
+            if ($barcodeVal === '') {
+                $barcodeVal = $this->generate_unique_barcode($adminId);
+                $this->db->where('id', $prod['id'])->update('product', ['barcode' => $barcodeVal]);
+            }
+            $copies = $idCopiesMap[$prod['id']] ?? 1;
+
+            $pngData = $generator->getBarcode($barcodeVal, $generator::TYPE_CODE_128, 2, 55);
+            $base64 = base64_encode($pngData);
+
+            $items[] = [
+                'product_id'   => (int) $prod['id'],
+                'product_name' => $prod['name'],
+                'sale_price'   => (float) ($prod['sale_price'] ?? $prod['price'] ?? 0),
+                'barcode'      => $barcodeVal,
+                'image_base64' => $base64,
+                'copies'       => $copies,
+            ];
+        }
+
+        $this->send_response(true, 'Barcode sheet data generated.', ['items' => $items]);
+    }
+
+    private function generate_unique_barcode(int $adminId): string
+    {
+        do {
+            $code = (string) mt_rand(100000, 999999);
+            $exists = $this->db
+                ->where('barcode', $code)
+                ->where('admin_id', $adminId)
+                ->count_all_results('product');
+        } while ($exists > 0);
+
+        return $code;
     }
 
     /*=======================================================================
@@ -1367,42 +1615,103 @@ class Api extends CI_Controller
         $this->require_method('GET');
         $adminId = $this->require_token_user_id();
 
+        $page = (int) $this->input_value('page', '0');
+        $limit = max(1, min(100, (int) $this->input_value('limit', '10')));
         $search = trim((string) $this->input_value('search'));
         $type = trim((string) $this->input_value('type'));
 
-        $this->db->select('customers.*, 
-            COALESCE(SUM(sales.grand_total), 0) AS total_business,
-            COALESCE(SUM(CASE WHEN sales.status != "paid" THEN sales.grand_total ELSE 0 END), 0) AS outstanding_amount')
-            ->from('customers')
-            ->join('sales', 'sales.customer_id = customers.id', 'left')
-            ->where('customers.admin_id', $adminId)
-            ->where('customers.isActive', 1);
+        if ($page > 0) {
+            $this->db->from('customers')
+                ->where('customers.admin_id', $adminId)
+                ->where('customers.isActive', 1);
 
-        if (!empty($search)) {
-            $this->db->group_start()
-                ->like('customers.name', $search)
-                ->or_like('customers.phone', $search)
-                ->or_like('customers.email', $search)
-                ->or_like('customers.company', $search)
-                ->group_end();
+            if (!empty($search)) {
+                $this->db->group_start()
+                    ->like('customers.name', $search)
+                    ->or_like('customers.phone', $search)
+                    ->or_like('customers.email', $search)
+                    ->or_like('customers.company', $search)
+                    ->group_end();
+            }
+
+            if (!empty($type) && $type !== 'all') {
+                $this->db->where('customers.type', $type);
+            }
+
+            $countDb = clone $this->db;
+            $totalRows = (int) $countDb->count_all_results('', false);
+
+            $offset = ($page - 1) * $limit;
+            $parties = $this->db
+                ->select('customers.*, 
+                    COALESCE(SUM(sales.grand_total), 0) AS total_business,
+                    COALESCE(SUM(CASE WHEN sales.status != "paid" THEN sales.grand_total ELSE 0 END), 0) AS outstanding_amount')
+                ->join('sales', 'sales.customer_id = customers.id', 'left')
+                ->group_by('customers.id')
+                ->order_by('customers.id', 'DESC')
+                ->limit($limit, $offset)
+                ->get()
+                ->result_array();
+
+            foreach ($parties as &$p) {
+                $p['id'] = (int)$p['id'];
+                $p['total_business'] = (float)$p['total_business'];
+                $p['outstanding_amount'] = (float)$p['outstanding_amount'];
+            }
+
+            // Stats across all parties for this business
+            $statsRow = $this->db
+                ->select('COALESCE(SUM(grand_total), 0) AS total_vol')
+                ->from('sales')
+                ->where('admin_id', $adminId)
+                ->get()
+                ->row();
+
+            $totalSalesVol = (float) ($statsRow->total_vol ?? 0);
+
+            $this->send_response(true, 'Parties list fetched successfully.', [
+                'parties'            => $parties,
+                'total_rows'         => $totalRows,
+                'total_pages'        => (int) ceil($totalRows / $limit),
+                'current_page'       => $page,
+                'limit'              => $limit,
+                'total_sales_volume' => $totalSalesVol
+            ]);
+        } else {
+            $this->db->select('customers.*, 
+                COALESCE(SUM(sales.grand_total), 0) AS total_business,
+                COALESCE(SUM(CASE WHEN sales.status != "paid" THEN sales.grand_total ELSE 0 END), 0) AS outstanding_amount')
+                ->from('customers')
+                ->join('sales', 'sales.customer_id = customers.id', 'left')
+                ->where('customers.admin_id', $adminId)
+                ->where('customers.isActive', 1);
+
+            if (!empty($search)) {
+                $this->db->group_start()
+                    ->like('customers.name', $search)
+                    ->or_like('customers.phone', $search)
+                    ->or_like('customers.email', $search)
+                    ->or_like('customers.company', $search)
+                    ->group_end();
+            }
+
+            if (!empty($type) && $type !== 'all') {
+                $this->db->where('customers.type', $type);
+            }
+
+            $parties = $this->db->group_by('customers.id')
+                ->order_by('customers.id', 'DESC')
+                ->get()
+                ->result_array();
+
+            foreach ($parties as &$p) {
+                $p['id'] = (int)$p['id'];
+                $p['total_business'] = (float)$p['total_business'];
+                $p['outstanding_amount'] = (float)$p['outstanding_amount'];
+            }
+
+            $this->send_response(true, 'Parties list fetched successfully.', $parties);
         }
-
-        if (!empty($type) && $type !== 'all') {
-            $this->db->where('customers.type', $type);
-        }
-
-        $parties = $this->db->group_by('customers.id')
-            ->order_by('customers.id', 'DESC')
-            ->get()
-            ->result_array();
-
-        foreach ($parties as &$p) {
-            $p['id'] = (int)$p['id'];
-            $p['total_business'] = (float)$p['total_business'];
-            $p['outstanding_amount'] = (float)$p['outstanding_amount'];
-        }
-
-        $this->send_response(true, 'Parties list fetched successfully.', $parties);
     }
 
     /*-----------------------------------------------------------------------
@@ -1574,7 +1883,7 @@ class Api extends CI_Controller
         ];
 
         $page = max(1, (int) $this->input_value('page', '1'));
-        $limit = 10;
+        $limit = max(1, min(100, (int) $this->input_value('limit', '10')));
         $offset = ($page - 1) * $limit;
 
         $totalRows = $this->Sales_model->get_sales_count($adminId, $filters);
@@ -1603,6 +1912,16 @@ class Api extends CI_Controller
         }
         $totalRevenueRow = $revenueQuery->get()->row();
         $totalRevenue = (float) ($totalRevenueRow->grand_total ?? 0);
+
+        foreach ($sales as &$s) {
+            $s['print_invoice_url'] = base_url('sales/print_invoice/' . $s['id']);
+            $pdfFile = FCPATH . 'uploads/invoices/invoice-' . $s['id'] . '.pdf';
+            $jpgFile = FCPATH . 'uploads/invoices/invoice-' . $s['id'] . '.jpg';
+            $s['invoice_pdf_url'] = file_exists($pdfFile) ? base_url('uploads/invoices/invoice-' . $s['id'] . '.pdf') : null;
+            $s['invoice_image_url'] = file_exists($jpgFile) ? base_url('uploads/invoices/invoice-' . $s['id'] . '.jpg') : null;
+            $s['whatsapp_url'] = $this->build_client_whatsapp_url($s);
+        }
+        unset($s);
 
         $this->send_response(true, 'Sales list fetched successfully.', [
             'sales'         => $sales,
@@ -1636,6 +1955,24 @@ class Api extends CI_Controller
             $this->send_response(false, 'Sale not found.', null, 404);
         }
 
+        $adminData = $this->db->where('id', $adminId)->get('users')->row_array();
+        $invoiceSettings = $this->db->where('admin_id', $adminId)->get('invoice_settings')->row_array();
+        $sale['print_invoice_url'] = base_url('sales/print_invoice/' . $saleId);
+        $sale['business_info'] = [
+            'name'      => $adminData['business_name'] ?? 'KAUSHIK',
+            'phone'     => $adminData['mobile'] ?? $adminData['phone'] ?? '',
+            'address'   => $adminData['address'] ?? '',
+            'logo_url'  => !empty($adminData['profile_image']) ? base_url('uploads/profile/' . $adminData['profile_image']) : null,
+        ];
+        $sale['invoice_settings'] = $invoiceSettings ?: [
+            'template_id'   => 1,
+            'primary_color' => '#0f172a',
+            'accent_color'  => '#2563eb',
+        ];
+        $sale['signature_url'] = !empty($invoiceSettings['signature_image'])
+            ? base_url('uploads/signatures/' . $invoiceSettings['signature_image'])
+            : null;
+
         $this->send_response(true, 'Sale details fetched successfully.', $sale);
     }
 
@@ -1666,17 +2003,69 @@ class Api extends CI_Controller
             $saleData = $this->Sales_model->create_sale($adminId, $request);
 
             $pdfUrl = null;
+            $imageUrl = null;
             try {
                 $pdfUrl = $this->Sales_model->generate_invoice_pdf($saleData['sale_id'], $adminId);
+                $jpgFile = FCPATH . 'uploads/invoices/invoice-' . $saleData['sale_id'] . '.jpg';
+                if (file_exists($jpgFile)) {
+                    $imageUrl = base_url('uploads/invoices/invoice-' . $saleData['sale_id'] . '.jpg');
+                }
             } catch (Exception $e) {
-                log_message('error', 'API PDF generation failed: ' . $e->getMessage());
+                log_message('error', 'API PDF/Image generation failed: ' . $e->getMessage());
             }
 
             $sale = $this->Sales_model->get_sale_detail($saleData['sale_id'], $adminId);
+            $printInvoiceUrl = base_url('sales/print_invoice/' . $saleData['sale_id']);
+            $sale['print_invoice_url'] = $printInvoiceUrl;
+            $sale['invoice_image_url'] = $imageUrl;
+
+            $whatsappUrl = $this->build_client_whatsapp_url($sale, $customerPhone);
+            $waRoute = 'skipped';
+            $cleanPhone = preg_replace('/\D+/', '', $customerPhone);
+            if (!empty($cleanPhone) && strlen($cleanPhone) >= 10 && $pdfUrl) {
+                try {
+                    $this->load->library('whatsapp_sender');
+                    $dir = FCPATH . 'uploads/invoices/';
+                    $rand = bin2hex(random_bytes(8));
+                    $pdfFile = 'inv_' . $saleData['sale_id'] . '_' . $rand . '.pdf';
+                    $src = $dir . 'invoice-' . $saleData['sale_id'] . '.pdf';
+                    if (is_file($src)) {
+                        copy($src, $dir . $pdfFile);
+                    }
+                    $jpg = $this->whatsapp_sender->make_preview_image(
+                        $dir . $pdfFile,
+                        $dir . 'inv_' . $saleData['sale_id'] . '_' . $rand
+                    );
+                    $userRow = $this->db->select('name, business_name, instagram')->where('id', $adminId)->get('users')->row_array();
+                    $waRoute = $this->whatsapp_sender->send_invoice(
+                        $adminId,
+                        $customerPhone,
+                        $pdfUrl,
+                        [
+                            'business_name' => !empty($userRow['business_name']) ? $userRow['business_name'] : ($userRow['name'] ?? 'Bills Book'),
+                            'customer_name' => $sale['customer_name'] ?? 'Valued Customer',
+                            'invoice_no'    => $sale['invoice_number'] ?? ('INV-' . $saleData['sale_id']),
+                            'amount'        => number_format((float)($sale['grand_total'] ?? 0), 2, '.', ''),
+                            'instagram'     => $userRow['instagram'] ?? '',
+                            'pdf_file'      => $pdfFile,
+                            'image_url'     => $jpg ? base_url('uploads/invoices/' . basename($jpg)) : '',
+                        ]
+                    );
+                } catch (Exception $e) {
+                    log_message('error', 'WA send in add_sale failed: ' . $e->getMessage());
+                }
+            }
+
+            $sale['whatsapp_url'] = $whatsappUrl;
+            $sale['whatsapp_route'] = $waRoute;
 
             $this->send_response(true, 'Sale created successfully.', [
                 'sale' => $sale,
-                'invoice_pdf_url' => $pdfUrl
+                'invoice_pdf_url' => $pdfUrl,
+                'invoice_image_url' => $imageUrl,
+                'print_invoice_url' => $printInvoiceUrl,
+                'whatsapp_url' => $whatsappUrl,
+                'whatsapp_route' => $waRoute
             ], 201);
 
         } catch (Exception $e) {
@@ -1717,17 +2106,25 @@ class Api extends CI_Controller
             $saleData = $this->Sales_model->update_sale($saleId, $adminId, $request);
 
             $pdfUrl = null;
+            $imageUrl = null;
             try {
                 $pdfUrl = $this->Sales_model->generate_invoice_pdf($saleId, $adminId);
+                $jpgFile = FCPATH . 'uploads/invoices/invoice-' . $saleId . '.jpg';
+                if (file_exists($jpgFile)) {
+                    $imageUrl = base_url('uploads/invoices/invoice-' . $saleId . '.jpg');
+                }
             } catch (Exception $e) {
                 log_message('error', 'API PDF regeneration failed: ' . $e->getMessage());
             }
 
             $sale = $this->Sales_model->get_sale_detail($saleId, $adminId);
+            $sale['invoice_image_url'] = $imageUrl;
 
             $this->send_response(true, 'Sale updated successfully.', [
                 'sale' => $sale,
-                'invoice_pdf_url' => $pdfUrl
+                'invoice_pdf_url' => $pdfUrl,
+                'invoice_image_url' => $imageUrl,
+                'print_invoice_url' => base_url('sales/print_invoice/' . $saleId)
             ]);
 
         } catch (Exception $e) {
@@ -2453,5 +2850,216 @@ class Api extends CI_Controller
                 }
                 break;
         }
+    }
+
+    /*=======================================================================
+    | WHATSAPP CONNECT & DISPATCH ENDPOINTS
+    |=======================================================================*/
+
+    /*-----------------------------------------------------------------------
+    | GET WHATSAPP STATUS
+    | GET /api/whatsapp-status or /api/whatsapp/status
+    |-----------------------------------------------------------------------*/
+    public function whatsapp_status(): void
+    {
+        $this->require_method('GET');
+        $adminId = $this->require_token_user_id();
+
+        $url = 'https://wa.visiontechnolabs.com/status/' . (int) $adminId;
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 6);
+        $response = curl_exec($ch);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        if ($curlError || $response === false) {
+            $this->send_response(false, 'Unable to connect to WhatsApp service gateway.', [
+                'connected' => false
+            ], 502);
+            return;
+        }
+
+        $data = json_decode($response, true);
+        $isConnected = !empty($data['connected']);
+
+        $this->send_response(true, 'WhatsApp status retrieved successfully.', [
+            'connected' => $isConnected,
+            'details'   => $data
+        ]);
+    }
+
+    /*-----------------------------------------------------------------------
+    | GET WHATSAPP QR CODE
+    | GET /api/whatsapp-qr or /api/whatsapp/qr
+    |-----------------------------------------------------------------------*/
+    public function whatsapp_qr(): void
+    {
+        $this->require_method('GET');
+        $adminId = $this->require_token_user_id();
+
+        $url = 'https://wa.visiontechnolabs.com/qr/' . (int) $adminId;
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+        $response = curl_exec($ch);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        if ($curlError || $response === false) {
+            $this->send_response(false, 'Failed to fetch QR code from WhatsApp gateway.', [
+                'qr' => null,
+                'connected' => false
+            ], 502);
+            return;
+        }
+
+        $data = json_decode($response, true);
+        $this->send_response(true, 'WhatsApp QR code retrieved.', [
+            'qr'        => $data['qr'] ?? '',
+            'connected' => !empty($data['connected'])
+        ]);
+    }
+
+    /*-----------------------------------------------------------------------
+    | LOGOUT / DISCONNECT WHATSAPP
+    | POST /api/whatsapp-logout or /api/whatsapp/logout
+    |-----------------------------------------------------------------------*/
+    public function whatsapp_logout(): void
+    {
+        $this->require_method('POST');
+        $adminId = $this->require_token_user_id();
+
+        $url = 'https://wa.visiontechnolabs.com/logout/' . (int) $adminId;
+
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+        $response = curl_exec($ch);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+
+        if ($curlError || $response === false) {
+            $this->send_response(false, 'Failed to disconnect WhatsApp session.', null, 502);
+            return;
+        }
+
+        $data = json_decode($response, true);
+        $this->send_response(true, 'WhatsApp disconnected successfully.', $data);
+    }
+
+    /*-----------------------------------------------------------------------
+    | SEND INVOICE VIA WHATSAPP
+    | POST /api/send-invoice-whatsapp
+    | Body: { "sale_id": 123, "phone": "optional custom phone" }
+    |-----------------------------------------------------------------------*/
+    public function send_invoice_whatsapp(): void
+    {
+        $this->require_method('POST');
+        $adminId = $this->require_token_user_id();
+
+        $request = $this->request_data();
+        $saleId = (int) ($request['sale_id'] ?? $request['id'] ?? 0);
+
+        if ($saleId <= 0) {
+            $this->send_response(false, 'Valid sale_id is required.', null, 400);
+            return;
+        }
+
+        $sale = $this->Sales_model->get_sale_detail($saleId, $adminId);
+        if (!$sale) {
+            $this->send_response(false, 'Sale not found.', null, 404);
+            return;
+        }
+
+        $phone = trim((string) ($request['phone'] ?? $sale['customer_phone'] ?? ''));
+        $cleanPhone = preg_replace('/\D+/', '', $phone);
+        if (empty($cleanPhone) || strlen($cleanPhone) < 10) {
+            $this->send_response(false, 'Customer has no valid 10-digit phone number.', null, 422);
+            return;
+        }
+
+        // Ensure PDF exists or generate it
+        $pdfUrl = base_url('uploads/invoices/invoice-' . $saleId . '.pdf');
+        $pdfPath = FCPATH . 'uploads/invoices/invoice-' . $saleId . '.pdf';
+        if (!file_exists($pdfPath)) {
+            try {
+                $pdfUrl = $this->Sales_model->generate_invoice_pdf($saleId, $adminId);
+            } catch (Exception $e) {
+                log_message('error', 'PDF generation failed for WA: ' . $e->getMessage());
+            }
+        }
+
+        // Generate whatsapp direct URL
+        $whatsappUrl = $this->build_client_whatsapp_url($sale, $phone);
+
+        // Load WhatsApp Sender library
+        $this->load->library('whatsapp_sender');
+
+        $dir = FCPATH . 'uploads/invoices/';
+        $rand = bin2hex(random_bytes(8));
+        $pdfFile = 'inv_' . $saleId . '_' . $rand . '.pdf';
+
+        if (is_file($pdfPath)) {
+            copy($pdfPath, $dir . $pdfFile);
+        }
+
+        $jpg = $this->whatsapp_sender->make_preview_image(
+            $dir . $pdfFile,
+            $dir . 'inv_' . $saleId . '_' . $rand
+        );
+
+        $userRow = $this->db->select('name, business_name, instagram, mobile')->where('id', $adminId)->get('users')->row_array();
+
+        $customerName = trim((string)($sale['customer_name'] ?? 'Valued Customer'));
+        $grandTotal = (float)($sale['grand_total'] ?? 0);
+
+        $route = $this->whatsapp_sender->send_invoice(
+            $adminId,
+            $cleanPhone,
+            $pdfUrl,
+            [
+                'business_name' => !empty($userRow['business_name']) ? $userRow['business_name'] : ($userRow['name'] ?? 'Bills Book'),
+                'customer_name' => $customerName,
+                'invoice_no'    => (string)($sale['invoice_number'] ?? ('INV-' . $saleId)),
+                'amount'        => number_format($grandTotal, 2, '.', ''),
+                'instagram'     => $userRow['instagram'] ?? '',
+                'pdf_file'      => $pdfFile,
+                'image_url'     => $jpg ? base_url('uploads/invoices/' . basename($jpg)) : '',
+            ]
+        );
+
+        $isSent = in_array($route, ['connected', 'official'], true);
+
+        $this->send_response(true, $isSent ? 'Invoice sent via WhatsApp (' . $route . ').' : 'WhatsApp attempt completed (' . $route . ').', [
+            'route'          => $route,
+            'is_sent'        => $isSent,
+            'whatsapp_url'   => $whatsappUrl,
+            'customer_phone' => $cleanPhone,
+            'invoice_number' => $sale['invoice_number'] ?? ''
+        ]);
+    }
+
+    public function build_client_whatsapp_url(array $sale, string $rawPhone = ''): string
+    {
+        $phone = preg_replace('/\D+/', '', $rawPhone ?: (string) ($sale['customer_phone'] ?? ''));
+        if (empty($phone)) return '';
+        if (strlen($phone) === 10) $phone = '91' . $phone;
+
+        $customerName = trim((string) ($sale['customer_name'] ?? 'Customer'));
+        $invoiceNumber = (string) ($sale['invoice_number'] ?? '');
+        $invoiceAmount = number_format((float) ($sale['grand_total'] ?? 0), 2);
+        $invoiceUrl = base_url('sales/print_invoice/' . (int)($sale['id'] ?? 0));
+
+        $message =
+            "Hi {$customerName},\n\n" .
+            "Your invoice {$invoiceNumber} is ready.\n" .
+            "Amount: Rs. {$invoiceAmount}\n\n" .
+            "View Invoice:\n{$invoiceUrl}\n\n" .
+            "Thank you for your business 🙏";
+
+        return 'https://api.whatsapp.com/send?phone=' . $phone . '&text=' . rawurlencode($message);
     }
 }

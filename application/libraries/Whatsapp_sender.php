@@ -168,16 +168,69 @@ log_message('error', 'WA official img=' . $imageUrl . ' pdf=' . $pdfFile);
 }
 public function make_preview_image($pdfPath, $outBasePath)
 {
-    if (!function_exists('exec') || !is_file($pdfPath)) return false;
+    $jpg = $outBasePath . '.jpg';
+
+    // 1. If matching invoice-*.jpg already exists in same dir, copy it instantly
+    $dir = dirname($pdfPath) . DIRECTORY_SEPARATOR;
+    if (preg_match('/(?:invoice|inv)[-_](\d+)/i', basename($pdfPath), $m)) {
+        $existingJpg = $dir . 'invoice-' . $m[1] . '.jpg';
+        if (is_file($existingJpg) && filesize($existingJpg) > 0) {
+            copy($existingJpg, $jpg);
+            return $jpg;
+        }
+    }
+
+    if (!function_exists('exec') || !is_file($pdfPath)) {
+        return is_file($jpg) ? $jpg : false;
+    }
+
+    // 2. Try pdftoppm (standard on Linux servers)
     $cmd = 'pdftoppm -jpeg -r 80 -f 1 -l 1 -singlefile '
          . escapeshellarg($pdfPath) . ' ' . escapeshellarg($outBasePath) . ' 2>&1';
-    exec($cmd, $out, $rc);
-    $jpg = $outBasePath . '.jpg';
-    if ($rc !== 0 || !is_file($jpg)) {
-        log_message('error', 'WA preview failed rc=' . $rc . ' ' . implode(' ', $out));
-        return false;
+    @exec($cmd, $out, $rc);
+    if ($rc === 0 && is_file($jpg)) {
+        return $jpg;
     }
-    return $jpg;
+
+    // 3. Try Headless Chrome or Edge (Windows local or Linux)
+    $browserCandidates = [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser'
+    ];
+    $browser = null;
+    foreach ($browserCandidates as $b) {
+        if (is_file($b)) {
+            $browser = $b;
+            break;
+        }
+    }
+
+    if ($browser) {
+        $tempPng = $outBasePath . '_temp.png';
+        $cmd = escapeshellarg($browser) . ' --headless=new --disable-gpu --screenshot=' . escapeshellarg($tempPng) . ' --window-size=850,1200 ' . escapeshellarg($pdfPath) . ' 2>&1';
+        @exec($cmd, $out, $rc);
+        if (is_file($tempPng)) {
+            if (function_exists('imagecreatefrompng') && function_exists('imagejpeg')) {
+                $pImg = @imagecreatefrompng($tempPng);
+                if ($pImg) {
+                    imagejpeg($pImg, $jpg, 85);
+                    imagedestroy($pImg);
+                }
+            }
+            @unlink($tempPng);
+            if (is_file($jpg)) {
+                return $jpg;
+            }
+        }
+    }
+
+    return is_file($jpg) ? $jpg : false;
 }
     /* ---------- Helpers ---------- */
     public function normalize_phone($phone)

@@ -827,6 +827,13 @@ log_message('error', 'STORE: about to redirect');
         $filePath = $folder . 'invoice-' . $saleId . '.pdf';
         file_put_contents($filePath, $dompdf->output());
 
+        try {
+            $this->load->model('Sales_model');
+            $this->Sales_model->generate_invoice_image($saleId, $adminId, $html, $filePath);
+        } catch (Exception $e) {
+            log_message('error', 'Sales.php JPG generation notice: ' . $e->getMessage());
+        }
+
         return base_url('uploads/invoices/invoice-' . $saleId . '.pdf');
     }
    private function isWhatsAppConnected($adminId)
