@@ -444,8 +444,8 @@ class Api extends CI_Controller
                 'mobile'        => $user->mobile,
                 'business_name' => $user->business_name,
                 'shop_name'     => $user->business_name, // alias
-                'profile_image' => base_url($user->profile_image),
-                'image'         => base_url($user->profile_image), // alias
+                'profile_image' => $this->resolve_profile_image($user->profile_image ?? ''),
+                'image'         => $this->resolve_profile_image($user->profile_image ?? ''), // alias
                 'role'          => (int) $user->role,
             ],
         ], 201);
@@ -649,8 +649,8 @@ class Api extends CI_Controller
                 'mobile'        => $user->mobile,
                 'business_name' => $user->business_name,
                 'shop_name'     => $user->business_name, // alias
-                'profile_image' => base_url($user->profile_image),
-                'image'         => base_url($user->profile_image), // alias
+                'profile_image' => $this->resolve_profile_image($user->profile_image ?? ''),
+                'image'         => $this->resolve_profile_image($user->profile_image ?? ''), // alias
                 'role'          => (int) $user->role,
             ],
         ]);
@@ -1889,15 +1889,16 @@ class Api extends CI_Controller
         $totalRows = $this->Sales_model->get_sales_count($adminId, $filters);
         $sales = $this->Sales_model->get_sales($adminId, $filters, $limit, $offset);
 
-        // Fetch totals (grand total revenue) for search context
-        $revenueQuery = $this->db
-            ->select_sum('grand_total')
+        // Fetch totals (grand total revenue and total profit) for search context
+        $totalsQuery = $this->db
+            ->select('COALESCE(SUM(sales.grand_total), 0) AS total_sales, COALESCE(SUM(si.profit), 0) AS total_profit', false)
             ->from('sales')
-            ->where('admin_id', $adminId);
+            ->join('(SELECT sale_id, SUM(line_total - (COALESCE(purchase_price, 0) * quantity)) AS profit FROM sale_items GROUP BY sale_id) si', 'si.sale_id = sales.id', 'left')
+            ->where('sales.admin_id', $adminId);
 
         if (!empty($filters['search'])) {
             $search = $filters['search'];
-            $revenueQuery->join('customers', 'customers.id = sales.customer_id', 'left')
+            $totalsQuery->join('customers', 'customers.id = sales.customer_id', 'left')
                 ->group_start()
                 ->like('sales.invoice_number', $search)
                 ->or_like('customers.name', $search)
@@ -1905,13 +1906,14 @@ class Api extends CI_Controller
                 ->group_end();
         }
         if (!empty($filters['date_from'])) {
-            $revenueQuery->where('DATE(sales.sale_date) >=', $filters['date_from']);
+            $totalsQuery->where('DATE(sales.sale_date) >=', $filters['date_from']);
         }
         if (!empty($filters['date_to'])) {
-            $revenueQuery->where('DATE(sales.sale_date) <=', $filters['date_to']);
+            $totalsQuery->where('DATE(sales.sale_date) <=', $filters['date_to']);
         }
-        $totalRevenueRow = $revenueQuery->get()->row();
-        $totalRevenue = (float) ($totalRevenueRow->grand_total ?? 0);
+        $totalsRow = $totalsQuery->get()->row_array();
+        $totalRevenue = (float) ($totalsRow['total_sales'] ?? 0);
+        $totalProfit  = (float) ($totalsRow['total_profit'] ?? 0);
 
         foreach ($sales as &$s) {
             $s['print_invoice_url'] = base_url('sales/print_invoice/' . $s['id']);
@@ -1928,7 +1930,9 @@ class Api extends CI_Controller
             'total_rows'    => $totalRows,
             'total_pages'   => ceil($totalRows / $limit),
             'current_page'  => $page,
-            'total_revenue' => $totalRevenue
+            'total_revenue' => $totalRevenue,
+            'total_sales'   => $totalRevenue,
+            'total_profit'  => $totalProfit,
         ]);
     }
 

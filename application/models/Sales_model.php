@@ -20,7 +20,7 @@ class Sales_model extends CI_Model
     public function get_sales(int $adminId, array $filters = [], int $limit = 10, int $offset = 0): array
     {
         $query = $this->db
-            ->select('sales.*, COALESCE(customers.name, "Walk-in Customer") AS customer_name, COALESCE(customers.phone, "-") AS customer_phone, COALESCE(customers.address, "-") AS customer_address, COUNT(sale_items.id) AS items_count, GROUP_CONCAT(sale_items.product_name SEPARATOR ", ") AS products_list')
+            ->select('sales.*, COALESCE(customers.name, "Walk-in Customer") AS customer_name, COALESCE(customers.phone, "-") AS customer_phone, COALESCE(customers.address, "-") AS customer_address, COUNT(sale_items.id) AS items_count, GROUP_CONCAT(sale_items.product_name SEPARATOR ", ") AS products_list, COALESCE(SUM(sale_items.line_total - (COALESCE(sale_items.purchase_price, 0) * sale_items.quantity)), 0) AS profit')
             ->from('sales')
             ->join('customers', 'customers.id = sales.customer_id', 'left')
             ->join('sale_items', 'sale_items.sale_id = sales.id', 'left')
