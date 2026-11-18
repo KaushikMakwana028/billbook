@@ -30,3 +30,7 @@ user_guide_src/cilexer/pycilexer.egg-info/*
 *.sublime-project
 /tests/tests/
 /tests/results/
+
+# WhatsApp configuration and library files
+application/config/whatsapp_official.php
+application/libraries/Whatsapp_sender.php
