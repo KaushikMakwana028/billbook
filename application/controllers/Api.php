@@ -94,7 +94,19 @@ class Api extends CI_Controller
 
     private function require_method(string $method): void
     {
-        if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') !== strtoupper($method)) {
+        $current = strtoupper($_SERVER['REQUEST_METHOD'] ?? '');
+        if ($current === 'OPTIONS') {
+            $this->send_response(true, 'OK', null, 200);
+        }
+
+        if ($current !== strtoupper($method)) {
+            // If POST was expected, allow request if body or parameters carry payload
+            if (strtoupper($method) === 'POST') {
+                $data = $this->request_data();
+                if (!empty($data)) {
+                    return;
+                }
+            }
             $this->send_response(false, 'Method not allowed. Please use ' . strtoupper($method) . '.', null, 405);
         }
     }
@@ -105,14 +117,14 @@ class Api extends CI_Controller
             return $this->request_data;
         }
 
-        if (strtoupper($_SERVER['REQUEST_METHOD'] ?? '') === 'GET') {
-            $this->request_data = $this->input->get() ?: [];
-            return $this->request_data;
-        }
+        $raw = $this->input->raw_input_stream;
+        $json = !empty($raw) ? json_decode($raw, true) : null;
+        $post = $this->input->post() ?: [];
+        $get  = $this->input->get() ?: [];
 
-        $json = json_decode($this->input->raw_input_stream, true);
         $this->request_data = array_merge(
-            $this->input->post() ?: [],
+            $get,
+            $post,
             is_array($json) ? $json : []
         );
 
@@ -172,10 +184,17 @@ class Api extends CI_Controller
         $header = $this->input->get_request_header('Authorization', true);
 
         if (!$header || !preg_match('/Bearer\s(\S+)/', $header, $matches)) {
-            $this->send_response(false, 'Authorization header missing. Please login first.', null, 401);
+            $cookieToken = $_COOKIE['bb_auth_token'] ?? (string) ($this->input->cookie('bb_auth_token') ?: '');
+            if (!empty($cookieToken)) {
+                $token = $cookieToken;
+            } else {
+                $this->send_response(false, 'Authorization header missing. Please login first.', null, 401);
+            }
+        } else {
+            $token = $matches[1];
         }
 
-        $token = $matches[1];
+        $this->current_token = $token;
 
         try {
             $decoded = JWT::decode($token, new Key($this->jwt_secret, 'HS256'));
@@ -637,6 +656,14 @@ class Api extends CI_Controller
         // Generate JWT
         $token = $this->generate_token($user);
 
+        // Set persistent cookie for mobile native OkHttpClient cookie store (1 year)
+        setcookie('bb_auth_token', $token, [
+            'expires'  => time() + (86400 * 365),
+            'path'     => '/',
+            'httponly' => false,
+            'samesite' => 'Lax'
+        ]);
+
         // Cleanup used OTP row
         $this->db->where('id', $otp_row->id)->delete('user_login_otps');
 
@@ -674,6 +701,12 @@ class Api extends CI_Controller
             'created_at' => date('Y-m-d H:i:s')
         ];
 
+        // Clear persistent cookie
+        setcookie('bb_auth_token', '', [
+            'expires'  => time() - 3600,
+            'path'     => '/',
+        ]);
+
         if ($this->db->insert('token_blacklist', $blacklistData)) {
             $this->send_response(true, 'Logged out successfully.');
         } else {
@@ -709,7 +742,12 @@ class Api extends CI_Controller
         $user->profile_image = $this->resolve_profile_image($user->profile_image ?? '');
         $user->image = $user->profile_image; // alias
 
-        $this->send_response(true, 'Profile fetched successfully.', $user);
+        $profileData = (array) $user;
+        if (!empty($this->current_token)) {
+            $profileData['token'] = $this->current_token;
+        }
+
+        $this->send_response(true, 'Profile fetched successfully.', $profileData);
     }
 
     /*-----------------------------------------------------------------------
@@ -1980,6 +2018,98 @@ class Api extends CI_Controller
         $this->send_response(true, 'Sale details fetched successfully.', $sale);
     }
 
+    /**
+     * Check if vendor has an active connected WhatsApp session directly via fast cURL
+     */
+    private function is_vendor_whatsapp_connected(int $adminId): bool
+    {
+        $ch = curl_init('https://wa.visiontechnolabs.com/status/' . $adminId);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 2,
+            CURLOPT_CONNECTTIMEOUT => 1,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false
+        ]);
+        $res = curl_exec($ch);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        if ($err || !$res) {
+            return false;
+        }
+
+        $json = json_decode($res, true);
+        if (!is_array($json) || !isset($json['connected'])) {
+            return false;
+        }
+
+        $c = $json['connected'];
+        return ($c === true || $c === 'true' || $c === 1 || $c === 'ready');
+    }
+
+    /**
+     * Send invoice PDF directly via vendor's connected WhatsApp gateway
+     */
+    private function send_connected_whatsapp_invoice(int $adminId, string $phone, string $pdfUrl, array $details): bool
+    {
+        $clean = preg_replace('/\D+/', '', $phone);
+        if (strlen($clean) === 10) {
+            $clean = '91' . $clean;
+        }
+        if (strlen($clean) !== 12 || substr($clean, 0, 2) !== '91') {
+            return false;
+        }
+
+        $businessName = !empty($details['business_name']) ? $details['business_name'] : 'BillBook Store';
+        $customerName = !empty($details['customer_name']) ? $details['customer_name'] : 'Valued Customer';
+        $invoiceNo    = !empty($details['invoice_no']) ? $details['invoice_no'] : '-';
+        $amount       = !empty($details['amount']) ? $details['amount'] : '0.00';
+
+        $caption = "Greetings from {$businessName} 👏\n\n"
+                 . "Dear {$customerName},\n"
+                 . "We are pleased to have you as a valued customer.\n\n"
+                 . "📄 Invoice No: *{$invoiceNo}*\n"
+                 . "💰 Amount: *₹{$amount}*\n\n"
+                 . "Please find attached your invoice.\n"
+                 . "Thank you for your business 🙏";
+
+        $payload = json_encode([
+            'userId'   => (string)$adminId,
+            'number'   => $clean,
+            'document' => $pdfUrl,
+            'caption'  => $caption
+        ], JSON_UNESCAPED_UNICODE);
+
+        $ch = curl_init('https://wa.visiontechnolabs.com/send-document');
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $payload,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 2,
+            CURLOPT_TIMEOUT        => 4,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false
+        ]);
+
+        $res  = curl_exec($ch);
+        $err  = curl_error($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        $this->last_wa_error = "code={$code} err={$err} res={$res}";
+
+        $json = json_decode($res, true);
+        if ($err || $code < 200 || $code >= 300 || empty($json) || empty($json['status'])) {
+            log_message('error', "Direct Connected WA Send Error: code={$code} err={$err} res={$res}");
+            return false;
+        }
+
+        log_message('info', "Direct Connected WA Send OK: admin={$adminId} phone={$clean} res={$res}");
+        return true;
+    }
+
     /*-----------------------------------------------------------------------
     | ADD SALE
     | POST /api/add_sale
@@ -2028,33 +2158,42 @@ class Api extends CI_Controller
             $cleanPhone = preg_replace('/\D+/', '', $customerPhone);
             if (!empty($cleanPhone) && strlen($cleanPhone) >= 10 && $pdfUrl) {
                 try {
-                    $this->load->library('whatsapp_sender');
-                    $dir = FCPATH . 'uploads/invoices/';
-                    $rand = bin2hex(random_bytes(8));
-                    $pdfFile = 'inv_' . $saleData['sale_id'] . '_' . $rand . '.pdf';
-                    $src = $dir . 'invoice-' . $saleData['sale_id'] . '.pdf';
-                    if (is_file($src)) {
-                        copy($src, $dir . $pdfFile);
-                    }
-                    $jpg = $this->whatsapp_sender->make_preview_image(
-                        $dir . $pdfFile,
-                        $dir . 'inv_' . $saleData['sale_id'] . '_' . $rand
-                    );
                     $userRow = $this->db->select('name, business_name, instagram')->where('id', $adminId)->get('users')->row_array();
-                    $waRoute = $this->whatsapp_sender->send_invoice(
-                        $adminId,
-                        $customerPhone,
-                        $pdfUrl,
-                        [
-                            'business_name' => !empty($userRow['business_name']) ? $userRow['business_name'] : ($userRow['name'] ?? 'Bills Book'),
-                            'customer_name' => $sale['customer_name'] ?? 'Valued Customer',
-                            'invoice_no'    => $sale['invoice_number'] ?? ('INV-' . $saleData['sale_id']),
-                            'amount'        => number_format((float)($sale['grand_total'] ?? 0), 2, '.', ''),
-                            'instagram'     => $userRow['instagram'] ?? '',
-                            'pdf_file'      => $pdfFile,
-                            'image_url'     => $jpg ? base_url('uploads/invoices/' . basename($jpg)) : '',
-                        ]
-                    );
+                    $bizName = !empty($userRow['business_name']) ? $userRow['business_name'] : ($userRow['name'] ?? 'BillBook Store');
+                    $invoiceDetails = [
+                        'business_name' => $bizName,
+                        'customer_name' => $sale['customer_name'] ?? 'Valued Customer',
+                        'invoice_no'    => $sale['invoice_number'] ?? ('INV-' . $saleData['sale_id']),
+                        'amount'        => number_format((float)($sale['grand_total'] ?? 0), 2, '.', ''),
+                        'instagram'     => $userRow['instagram'] ?? '',
+                    ];
+
+                    // Check if vendor WhatsApp is connected
+                    $isWaConnected = $this->is_vendor_whatsapp_connected($adminId);
+
+                    if ($isWaConnected) {
+                        // ── FLOW 1: Send through Admin's Connected WhatsApp Number ──
+                        $sent = $this->send_connected_whatsapp_invoice($adminId, $cleanPhone, $pdfUrl, $invoiceDetails);
+                        $waRoute = $sent ? 'connected' : 'failed';
+                    } else {
+                        // ── FLOW 2: Send through BillBook Official Number (Meta Cloud API) ──
+                        try {
+                            $this->load->library('whatsapp_sender');
+                            $sentOfficial = $this->whatsapp_sender->send_official(
+                                $adminId,
+                                $cleanPhone,
+                                $pdfUrl,
+                                array_merge($invoiceDetails, [
+                                    'pdf_file'  => 'invoice-' . $saleData['sale_id'] . '.pdf',
+                                    'image_url' => $imageUrl ?: '',
+                                ])
+                            );
+                            $waRoute = $sentOfficial ? 'official' : 'failed';
+                        } catch (Exception $e) {
+                            log_message('error', 'Official WA send in add_sale failed: ' . $e->getMessage());
+                            $waRoute = 'failed';
+                        }
+                    }
                 } catch (Exception $e) {
                     log_message('error', 'WA send in add_sale failed: ' . $e->getMessage());
                 }
@@ -2869,6 +3008,7 @@ class Api extends CI_Controller
         $this->require_method('GET');
         $adminId = $this->require_token_user_id();
 
+        $connectUrl = 'https://billbook.moneymitraa.com/whatsapp';
         $url = 'https://wa.visiontechnolabs.com/status/' . (int) $adminId;
 
         $ch = curl_init($url);
@@ -2880,17 +3020,22 @@ class Api extends CI_Controller
 
         if ($curlError || $response === false) {
             $this->send_response(false, 'Unable to connect to WhatsApp service gateway.', [
-                'connected' => false
+                'connected'   => false,
+                'connect_url' => $connectUrl
             ], 502);
             return;
         }
 
         $data = json_decode($response, true);
-        $isConnected = !empty($data['connected']);
+        $rawConnected = $data['connected'] ?? false;
+        $isConnected = ($rawConnected === true || $rawConnected === 'true' || $rawConnected === 1 || $rawConnected === 'ready');
+        $gatewayStatus = is_string($rawConnected) ? $rawConnected : ($isConnected ? 'connected' : 'disconnected');
 
         $this->send_response(true, 'WhatsApp status retrieved successfully.', [
-            'connected' => $isConnected,
-            'details'   => $data
+            'connected'      => $isConnected,
+            'gateway_status' => $gatewayStatus,
+            'connect_url'    => $connectUrl,
+            'details'        => $data
         ]);
     }
 
@@ -2903,6 +3048,7 @@ class Api extends CI_Controller
         $this->require_method('GET');
         $adminId = $this->require_token_user_id();
 
+        $connectUrl = 'https://billbook.moneymitraa.com/whatsapp';
         $url = 'https://wa.visiontechnolabs.com/qr/' . (int) $adminId;
 
         $ch = curl_init($url);
@@ -2914,17 +3060,37 @@ class Api extends CI_Controller
 
         if ($curlError || $response === false) {
             $this->send_response(false, 'Failed to fetch QR code from WhatsApp gateway.', [
-                'qr' => null,
-                'connected' => false
+                'qr'             => null,
+                'connected'      => false,
+                'gateway_status' => 'offline',
+                'connect_url'    => $connectUrl
             ], 502);
             return;
         }
 
         $data = json_decode($response, true);
+        $rawConnected = $data['connected'] ?? false;
+        $isConnected = ($rawConnected === true || $rawConnected === 'true' || $rawConnected === 1 || $rawConnected === 'ready');
+        $gatewayStatus = is_string($rawConnected) ? $rawConnected : ($isConnected ? 'connected' : 'disconnected');
+
         $this->send_response(true, 'WhatsApp QR code retrieved.', [
-            'qr'        => $data['qr'] ?? '',
-            'connected' => !empty($data['connected'])
+            'qr'             => $data['qr'] ?? '',
+            'connected'      => $isConnected,
+            'gateway_status' => $gatewayStatus,
+            'connect_url'    => $connectUrl
         ]);
+    }
+
+    /*-----------------------------------------------------------------------
+    | GET / REQUEST WHATSAPP PAIRING CODE (DEPRECATED - DIRECTED TO WEB)
+    | POST /api/whatsapp-pairing-code or /api/whatsapp/pairing-code
+    |-----------------------------------------------------------------------*/
+    public function whatsapp_pairing_code(): void
+    {
+        $connectUrl = 'https://billbook.moneymitraa.com/whatsapp';
+        $this->send_response(false, 'Pairing code is discontinued. Please connect via WhatsApp Web.', [
+            'connect_url' => $connectUrl
+        ], 410);
     }
 
     /*-----------------------------------------------------------------------
@@ -2939,19 +3105,20 @@ class Api extends CI_Controller
         $url = 'https://wa.visiontechnolabs.com/logout/' . (int) $adminId;
 
         $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 5,
+            CURLOPT_CONNECTTIMEOUT => 2,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false
+        ]);
         $response = curl_exec($ch);
-        $curlError = curl_error($ch);
         curl_close($ch);
 
-        if ($curlError || $response === false) {
-            $this->send_response(false, 'Failed to disconnect WhatsApp session.', null, 502);
-            return;
-        }
-
-        $data = json_decode($response, true);
-        $this->send_response(true, 'WhatsApp disconnected successfully.', $data);
+        $this->send_response(true, 'WhatsApp disconnected successfully.', [
+            'connected' => false,
+            'status'    => 'disconnected'
+        ]);
     }
 
     /*-----------------------------------------------------------------------
@@ -2999,41 +3166,45 @@ class Api extends CI_Controller
         // Generate whatsapp direct URL
         $whatsappUrl = $this->build_client_whatsapp_url($sale, $phone);
 
-        // Load WhatsApp Sender library
-        $this->load->library('whatsapp_sender');
-
-        $dir = FCPATH . 'uploads/invoices/';
-        $rand = bin2hex(random_bytes(8));
-        $pdfFile = 'inv_' . $saleId . '_' . $rand . '.pdf';
-
-        if (is_file($pdfPath)) {
-            copy($pdfPath, $dir . $pdfFile);
-        }
-
-        $jpg = $this->whatsapp_sender->make_preview_image(
-            $dir . $pdfFile,
-            $dir . 'inv_' . $saleId . '_' . $rand
-        );
-
         $userRow = $this->db->select('name, business_name, instagram, mobile')->where('id', $adminId)->get('users')->row_array();
-
+        $bizName = !empty($userRow['business_name']) ? $userRow['business_name'] : ($userRow['name'] ?? 'BillBook Store');
         $customerName = trim((string)($sale['customer_name'] ?? 'Valued Customer'));
         $grandTotal = (float)($sale['grand_total'] ?? 0);
 
-        $route = $this->whatsapp_sender->send_invoice(
-            $adminId,
-            $cleanPhone,
-            $pdfUrl,
-            [
-                'business_name' => !empty($userRow['business_name']) ? $userRow['business_name'] : ($userRow['name'] ?? 'Bills Book'),
-                'customer_name' => $customerName,
-                'invoice_no'    => (string)($sale['invoice_number'] ?? ('INV-' . $saleId)),
-                'amount'        => number_format($grandTotal, 2, '.', ''),
-                'instagram'     => $userRow['instagram'] ?? '',
-                'pdf_file'      => $pdfFile,
-                'image_url'     => $jpg ? base_url('uploads/invoices/' . basename($jpg)) : '',
-            ]
-        );
+        $invoiceDetails = [
+            'business_name' => $bizName,
+            'customer_name' => $customerName,
+            'invoice_no'    => (string)($sale['invoice_number'] ?? ('INV-' . $saleId)),
+            'amount'        => number_format($grandTotal, 2, '.', ''),
+            'instagram'     => $userRow['instagram'] ?? '',
+        ];
+
+        // Check if vendor WhatsApp is connected
+        $isWaConnected = $this->is_vendor_whatsapp_connected($adminId);
+
+        if ($isWaConnected) {
+            // ── FLOW 1: Send through Admin's Connected WhatsApp Number ──
+            $sent = $this->send_connected_whatsapp_invoice($adminId, $cleanPhone, $pdfUrl, $invoiceDetails);
+            $route = $sent ? 'connected' : 'failed';
+        } else {
+            // ── FLOW 2: Send through BillBook Official Number (Meta Cloud API) ──
+            try {
+                $this->load->library('whatsapp_sender');
+                $sentOfficial = $this->whatsapp_sender->send_official(
+                    $adminId,
+                    $cleanPhone,
+                    $pdfUrl,
+                    array_merge($invoiceDetails, [
+                        'pdf_file'  => 'invoice-' . $saleId . '.pdf',
+                        'image_url' => '',
+                    ])
+                );
+                $route = $sentOfficial ? 'official' : 'failed';
+            } catch (Exception $e) {
+                log_message('error', 'Official WA send in send_invoice_whatsapp failed: ' . $e->getMessage());
+                $route = 'failed';
+            }
+        }
 
         $isSent = in_array($route, ['connected', 'official'], true);
 
@@ -3042,7 +3213,8 @@ class Api extends CI_Controller
             'is_sent'        => $isSent,
             'whatsapp_url'   => $whatsappUrl,
             'customer_phone' => $cleanPhone,
-            'invoice_number' => $sale['invoice_number'] ?? ''
+            'invoice_number' => $sale['invoice_number'] ?? '',
+            'wa_debug'       => $this->last_wa_error ?? null
         ]);
     }
 
